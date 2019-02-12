@@ -1,0 +1,3 @@
+[[constraint]]
+  name = "github.com/radu-matei/kube-exec"
+  version = "v0.2"
