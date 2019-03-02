@@ -3,10 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
+	v12 "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -17,22 +21,52 @@ import (
 	"sync"
 )
 
+func getDeployment(r io.Reader) *v12.Deployment {
+	d := yaml.NewYAMLOrJSONDecoder(r, 100000)
+	var dep v12.Deployment
+	err := d.Decode(&dep)
+	if err != nil {
+		log.Fatalf("Failed to decode deployment file: %#v\n", err)
+	}
+	return &dep
+}
+
+func getCustomResource(r io.Reader) *unstructured.Unstructured {
+	d := yaml.NewYAMLOrJSONDecoder(r, 100000)
+	var u unstructured.Unstructured
+	err := d.Decode(&u)
+	if err != nil {
+		log.Fatalf("Failed to decode the cr: %#v\n", err)
+	}
+	return &u
+}
+
+func getReader(filepath string) *os.File {
+	f, err := os.Open(filepath)
+	if err != nil {
+		log.Fatalf("Could not open file:  %#v\n", err)
+		return nil
+	}
+	return f
+
+}
+
 func main() {
-	deploymentName := flag.String("deployment-name", "", "The ansible operator deployment name")
-	deploymentNamespace := flag.String("deployment-namespace", "default", "The namespace of the pod")
-	crName := flag.String("cr-name", "", "The name of the CR")
+	operatorYAML := flag.String("deployment-filepath", "./deploy/operator.yaml", "filepath of ansible-operator deployment file. Defaults to `./deploy/operator.yaml`")
+	operatorNamespace := flag.String("namespace", "default", "The namespace in which operator is running. Defaults to `default`")
+	crYAML := flag.String("cr-filepath", "./deploy/cr.yaml", "filepath of the cr yaml. Defaults to ./deploy/cr.yaml")
+	jobID := flag.String("job-id", "latest", "The job id for which logs needs to be displayed")
+
+	kubeconfig := flag.String("kubeconfig", "~/.kube/config", "filepath to the kubeconfig")
 
 	flag.Parse()
-	kubeconfig := os.Getenv("KUBECONFIG")
 
-	if kubeconfig == "" {
-		kubeconfig = "~/.kube/config"
-	}
+	deployment := getDeployment(getReader(*operatorYAML))
+	cr := getCustomResource(getReader(*crYAML))
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
-		log.Fatalln("Failed to create config")
-
+		log.Fatalf("Failed to create config: %#v\n", err)
 	}
 
 	restClient, err := kubernetes.NewForConfig(config)
@@ -40,11 +74,9 @@ func main() {
 		log.Fatalf("Failed to create clientset: %+v", err)
 	}
 
-	deployment, err := restClient.AppsV1().Deployments(*deploymentNamespace).Get(*deploymentName, metav1.GetOptions{})
-
 	labelSelector := deployment.Spec.Selector
 
-	watchInterface, err := restClient.CoreV1().Pods(*deploymentNamespace).Watch(metav1.ListOptions{LabelSelector: labels.Set(labelSelector.MatchLabels).String()})
+	watchInterface, err := restClient.CoreV1().Pods(*operatorNamespace).Watch(metav1.ListOptions{LabelSelector: labels.Set(labelSelector.MatchLabels).String()})
 
 	if err != nil {
 		log.Fatalf("Failed to watch the pods: %+v\n", err)
@@ -62,10 +94,6 @@ func main() {
 					fmt.Printf("Pod %+v added\n", pod.Name)
 					waitChan <- true
 				}
-				//else if e.Type == watch.Error {
-				//	pod, _ = e.Object.(*v1.Pod)
-				//	fmt.Printf("Pod %+v errored", pod.Name)
-				//}
 
 			}
 		}
@@ -73,17 +101,13 @@ func main() {
 	}()
 	<-waitChan
 	fmt.Println("Signal received")
-	go func() {
+	func() {
 		c, err := containerToAttachTo("", pod)
 		if err != nil {
 			log.Fatalf("Failed to get the container: %+v", err)
 		}
-		var jobId string
-		fmt.Println("Enter the Job id:")
-		fmt.Scanf("%s", &jobId)
 
-		command := "cat /tmp/ansible-operator/runner/osb.openshift.io/v1alpha1/AutomationBroker/" + *deploymentNamespace + "/" + *crName + "/artifacts/" + jobId + "/stdout"
-		//command := "cat /tmp/ansible-operator/runner/osb.openshift.io/v1alpha1/AutomationBroker/fail/ansible-service-broker/artifacts/" + jobId + "/stdout"
+		command := "cat /tmp/ansible-operator/runner/" + cr.GroupVersionKind().GroupVersion().String() + "/" + cr.GroupVersionKind().Kind + "/" + *operatorNamespace + "/" + cr.GetName() + "/artifacts/" + *jobID + "/stdout"
 		req := restClient.CoreV1().RESTClient().Post().
 			Resource("pods").
 			Name(pod.Name).
@@ -121,7 +145,7 @@ func main() {
 			log.Fatalf("Failed to run the command: %+v", err)
 		}
 	}()
-	wg.Wait()
+	return
 }
 
 // containerToAttach returns a reference to the container to attach to, given
